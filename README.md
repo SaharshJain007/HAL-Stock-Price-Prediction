@@ -1,0 +1,1 @@
+This project aims to predict daily closing prices for HAL for the next 30 days using historical data. The repository contains a report to understand the project better as well as the code and the dataset used.
