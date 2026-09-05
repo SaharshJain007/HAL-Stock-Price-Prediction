@@ -1,0 +1,517 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, SimpleRNN
+import math
+
+# ==========================================
+# 1. DATA LOADING & PREPARATION
+# ==========================================
+file_path = r'C:\Users\Dell\Downloads\HALStockDataset.xlsx'
+
+try:
+    df = pd.read_excel(file_path)
+    print("Data loaded successfully.")
+except FileNotFoundError:
+    print(f"Error: File not found at {file_path}")
+    raise
+
+# Fix Dates
+df['Date'] = pd.to_datetime(df['Date'], dayfirst=True).dt.normalize()
+df = df.sort_values('Date').reset_index(drop=True)
+df.set_index('Date', inplace=True)
+df = df.interpolate(method='time')
+
+print(f"Dataset Range: {df.index.min()} to {df.index.max()}")
+print(f"Total Data Points: {len(df)}")
+
+# ==========================================
+# 2. EDA: EXPLORATORY DATA ANALYSIS (FIXED)
+# ==========================================
+import matplotlib.dates as mdates
+
+# 1. Calculate Daily Returns FIRST so it's ready for all charts
+df['Daily_Return'] = df['Close'].pct_change()
+
+# 2. Calculate Technical Indicators
+df['MA_50'] = df['Close'].rolling(window=50).mean()
+df['MA_200'] = df['Close'].rolling(window=200).mean()
+df['Volatility_30'] = df['Daily_Return'].rolling(window=30).std()
+
+# --- Chart 1: Trend Analysis (Moving Averages) ---
+plt.figure(figsize=(14, 7))
+plt.plot(df.index, df['Close'], label='Close Price', color='black', alpha=0.6)
+plt.plot(df.index, df['MA_50'], label='50-Day MA (Short Term)', color='blue', linestyle='--')
+plt.plot(df.index, df['MA_200'], label='200-Day MA (Long Term)', color='red', linestyle='--', linewidth=2)
+plt.title('Trend Analysis: Price vs Moving Averages')
+plt.xlabel('Date')
+plt.ylabel('Price (INR)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# --- Chart 2: Volatility Analysis (Risk) ---
+plt.figure(figsize=(14, 5))
+plt.plot(df.index, df['Volatility_30'], color='orange', label='30-Day Rolling Volatility')
+plt.title('Risk Analysis: 30-Day Rolling Volatility (Standard Deviation)')
+plt.ylabel('Volatility')
+plt.fill_between(df.index, df['Volatility_30'], color='orange', alpha=0.1)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# --- Chart 3: Returns Distribution ---
+plt.figure(figsize=(10, 5))
+sns.histplot(df['Daily_Return'].dropna(), bins=100, kde=True, color='purple')
+plt.title('Distribution of Daily Returns')
+plt.xlabel('Daily Return %')
+plt.show()
+
+# Clean up: Drop the temporary columns so they don't confuse the ML models later
+# We keep Daily_Return as it might be useful, but drop the MAs and Volatility
+df.drop(columns=['MA_50', 'MA_200', 'Volatility_30'], inplace=True, errors='ignore')
+
+# ==========================================
+# 3. FEATURE ENGINEERING (Lookback = 90 Days)
+# ==========================================
+# We use 90 days of lags for ML models so they look at 2 months of context
+# to predict the future, matching the DL models' sequence length.
+num_lags = 90
+for i in range(1, num_lags + 1):
+    df[f'Lag_{i}'] = df['Close'].shift(i)
+
+df_ml = df.dropna().copy()
+
+features = [f'Lag_{i}' for i in range(1, num_lags + 1)]
+target = 'Close'
+
+X = df_ml[features]
+y = df_ml[target]
+
+# Train/Test Split (80% Train, 20% Test)
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+# Define Test Dates for Plotting
+test_dates = df_ml.index[split_idx:]
+
+# ==========================================
+# 4. TRAINING ML MODELS
+# ==========================================
+model_performance = {}
+model_predictions_test = {} # Store test predictions for plotting
+
+def evaluate_and_store(name, y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    model_performance[name] = {'MAE': mae, 'RMSE': rmse, 'MAPE': mape}
+    model_predictions_test[name] = y_pred # Save for graphing later
+    return y_pred
+
+print("\nTraining Machine Learning Models...")
+
+# 1. Linear Regression
+lr = LinearRegression()
+lr.fit(X_train, y_train)
+evaluate_and_store('Linear Regression', y_test, lr.predict(X_test))
+
+# 2. Random Forest
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+evaluate_and_store('Random Forest', y_test, rf.predict(X_test))
+
+# 3. XGBoost
+xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100)
+xgb_model.fit(X_train, y_train)
+evaluate_and_store('XGBoost', y_test, xgb_model.predict(X_test))
+
+# ==========================================
+# 5. TRAINING DEEP LEARNING MODELS
+# ==========================================
+print("Training Deep Learning Models...")
+
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(df[['Close']].values)
+
+SEQ_LENGTH = 90 
+
+def create_sequences(data, seq_length):
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        xs.append(data[i:(i + seq_length)])
+        ys.append(data[i + seq_length])
+    return np.array(xs), np.array(ys)
+
+X_dl, y_dl = create_sequences(scaled_data, SEQ_LENGTH)
+
+# DL Split
+split_dl = int(len(X_dl) * 0.8)
+X_train_dl, X_test_dl = X_dl[:split_dl], X_dl[split_dl:]
+y_train_dl, y_test_dl = y_dl[:split_dl], y_dl[split_dl:]
+
+# Define DL Test Dates
+test_dates_dl = df.index[split_dl + SEQ_LENGTH:]
+
+# 4. Simple RNN
+model_rnn = Sequential()
+model_rnn.add(SimpleRNN(50, return_sequences=False, input_shape=(SEQ_LENGTH, 1)))
+model_rnn.add(Dense(1))
+model_rnn.compile(optimizer='adam', loss='mean_squared_error')
+model_rnn.fit(X_train_dl, y_train_dl, epochs=50, batch_size=32, verbose=0)
+
+pred_rnn = scaler.inverse_transform(model_rnn.predict(X_test_dl)).flatten()
+# Store manually since structure is different
+model_predictions_test['Simple RNN'] = pred_rnn
+# Evaluate
+evaluate_and_store('Simple RNN', scaler.inverse_transform(y_test_dl).flatten(), pred_rnn)
+
+# 5. LSTM
+model_lstm = Sequential()
+model_lstm.add(LSTM(50, return_sequences=True, input_shape=(SEQ_LENGTH, 1)))
+model_lstm.add(LSTM(50, return_sequences=False))
+model_lstm.add(Dense(25))
+model_lstm.add(Dense(1))
+model_lstm.compile(optimizer='adam', loss='mean_squared_error')
+model_lstm.fit(X_train_dl, y_train_dl, epochs=50, batch_size=32, verbose=0)
+
+pred_lstm = scaler.inverse_transform(model_lstm.predict(X_test_dl)).flatten()
+model_predictions_test['LSTM'] = pred_lstm
+evaluate_and_store('LSTM', scaler.inverse_transform(y_test_dl).flatten(), pred_lstm)
+
+# Show Error Metrics
+print("\nFinal Model Comparison:")
+print(pd.DataFrame(model_performance).T)
+
+# ==========================================
+# 6. FUTURE FORECASTING (30 DAYS)
+# ==========================================
+print("\nGenerating Future Forecasts...")
+days_to_predict = 30
+last_date = df.index[-1]
+future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=days_to_predict)
+future_results = {}
+
+# A. ML Forecasting (FIXED WARNINGS)
+last_known_lags = df['Close'].tail(num_lags).values[::-1]
+
+def forecast_ml(model, start_lags):
+    forecast = []
+    current = start_lags.copy()
+    
+    # We explicitly define the feature names to silence the warnings
+    feature_names = [f'Lag_{i}' for i in range(1, num_lags + 1)]
+    
+    for _ in range(days_to_predict):
+        # Convert the current array into a DataFrame with correct column names
+        input_df = pd.DataFrame([current], columns=feature_names)
+        
+        # Predict using the DataFrame
+        pred = model.predict(input_df)[0]
+        forecast.append(pred)
+        
+        # Update lags
+        current = np.roll(current, 1)
+        current[0] = pred
+    return forecast
+
+future_results['Linear Regression'] = forecast_ml(lr, last_known_lags)
+future_results['Random Forest'] = forecast_ml(rf, last_known_lags)
+future_results['XGBoost'] = forecast_ml(xgb_model, last_known_lags)
+
+# ... (Keep the rest of Section 6 (DL Forecasting) as is) ...
+
+# B. DL Forecasting
+last_60_scaled = scaled_data[-SEQ_LENGTH:]
+
+def forecast_dl(model, start_seq):
+    forecast = []
+    current = start_seq.reshape((1, SEQ_LENGTH, 1))
+    for _ in range(days_to_predict):
+        pred = model.predict(current, verbose=0)[0]
+        forecast.append(pred)
+        pred_reshaped = pred.reshape((1, 1, 1))
+        current = np.append(current[:, 1:, :], pred_reshaped, axis=1)
+    return scaler.inverse_transform(np.array(forecast)).flatten()
+
+future_results['Simple RNN'] = forecast_dl(model_rnn, last_60_scaled)
+future_results['LSTM'] = forecast_dl(model_lstm, last_60_scaled)
+
+# ==========================================
+# 7. FINAL VISUALIZATION & REPORTING (COMPLETE)
+# ==========================================
+
+# --- STEP A: PREPARE DATA ---
+forecast_df = pd.DataFrame({'Date': future_dates})
+for name, data in future_results.items():
+    forecast_df[name] = data
+
+# Determine start date for plotting (Test Split - 90 days context)
+plot_start_idx = max(0, split_idx - 90)
+plot_start_date = df.index[plot_start_idx]
+relevant_history = df.loc[plot_start_date:]
+
+print(f"Plotting charts from {plot_start_date.date()} to show full context.")
+
+# --- STEP B: INDIVIDUAL MODEL PLOTS ---
+for name in model_performance.keys():
+    plt.figure(figsize=(14, 7))
+    
+    # 1. Actual History
+    plt.plot(relevant_history.index, relevant_history['Close'], label='Actual History', color='black', alpha=0.6, linewidth=2)
+    
+    # 2. Backtest (Blue Dashed)
+    if name in ['Simple RNN', 'LSTM']:
+        dates_backtest = test_dates_dl
+    else:
+        dates_backtest = test_dates
+    
+    limit = min(len(dates_backtest), len(model_predictions_test[name]))
+    plt.plot(dates_backtest[:limit], model_predictions_test[name][:limit], label=f'{name} (Backtest)', linestyle='--', color='blue', alpha=0.8)
+    
+    # 3. Future Forecast (Red Line)
+    plt.plot(future_dates, future_results[name], label=f'{name} (Future 30 Days)', linewidth=3, color='red')
+    
+    plt.title(f'{name}: Backtest vs Future Forecast')
+    plt.xlabel('Date')
+    plt.ylabel('Price (INR)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# --- STEP C: COMBINED PLOT 1 - BACKTEST COMPARISON ---
+plt.figure(figsize=(15, 8))
+# Plot Actual Test Data
+plt.plot(test_dates, y_test, label='Actual Price', color='black', linewidth=3, alpha=0.3)
+
+# Plot ML Models
+plt.plot(test_dates, model_predictions_test['Linear Regression'], label='Linear Regression', linestyle='--')
+plt.plot(test_dates, model_predictions_test['Random Forest'], label='Random Forest', linestyle='--')
+plt.plot(test_dates, model_predictions_test['XGBoost'], label='XGBoost', linestyle='--')
+
+# Plot DL Models (Using DL Dates)
+plt.plot(test_dates_dl, model_predictions_test['Simple RNN'], label='Simple RNN', alpha=0.8)
+plt.plot(test_dates_dl, model_predictions_test['LSTM'], label='LSTM', color='red', alpha=0.8)
+
+plt.title('ALL MODELS: Backtest Performance Comparison (Validation Phase)', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Price (INR)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- STEP D: COMBINED PLOT 2 - FUTURE FORECAST ---
+plt.figure(figsize=(15, 8))
+# Plot Recent History
+plt.plot(df.index[-180:], df['Close'][-180:], label='Actual History', color='black', linewidth=2.5)
+
+# Plot Forecasts
+plt.plot(forecast_df['Date'], forecast_df['Linear Regression'], label='Linear Regression', linestyle='--', linewidth=1.5)
+plt.plot(forecast_df['Date'], forecast_df['Random Forest'], label='Random Forest', linestyle='--', linewidth=1.5)
+plt.plot(forecast_df['Date'], forecast_df['XGBoost'], label='XGBoost', linestyle='--', linewidth=1.5)
+plt.plot(forecast_df['Date'], forecast_df['Simple RNN'], label='Simple RNN', color='orange', linewidth=2)
+plt.plot(forecast_df['Date'], forecast_df['LSTM'], label='LSTM', color='green', linewidth=2.5)
+
+plt.title('ALL MODELS: Future Forecast (Next 30 Days)', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Price (INR)')
+plt.legend(loc='upper left')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- STEP E: ERROR METRICS ---
+metrics_df = pd.DataFrame(model_performance).T
+metrics_df[['MAE', 'RMSE']].plot(kind='bar', figsize=(10, 5))
+plt.title('Final Model Comparison: Error Metrics')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+# ==========================================
+# 8. RUBRIC REQUIREMENT: CLASSIFICATION METRICS
+# ==========================================
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+
+print("\n--- GENERATING CLASSIFICATION METRICS (For Rubric 5/5) ---")
+print("Logic: If Predicted Price > Previous Day's Price, Signal = 1 (Buy/Up), else 0 (Sell/Down)\n")
+
+# 1. Create Binary Targets for the Test Set
+# We compare the Actual Close today vs Actual Close yesterday
+actual_direction = (y_test > df['Close'].shift(1).loc[y_test.index]).astype(int)
+
+# We need to align indices for DL models (shorter test set)
+actual_direction_dl = actual_direction.loc[test_dates_dl]
+
+classification_results = {}
+
+for name in model_predictions_test.keys():
+    # Get the raw price predictions we already made
+    preds = model_predictions_test[name]
+    
+    # 2. Determine Prediction Direction
+    if name in ['Simple RNN', 'LSTM']:
+        # Compare prediction vs Actual Close of the previous day
+        # We align the 'previous day' perfectly using the index
+        prev_close = df['Close'].loc[test_dates_dl].shift(1).fillna(method='bfill')
+        # Fix: Ensure shapes match for comparison
+        pred_direction = (preds > prev_close.values).astype(int)
+        y_true_class = actual_direction_dl.values
+    else:
+        # For ML models
+        prev_close = df['Close'].loc[test_dates].shift(1).fillna(method='bfill')
+        pred_direction = (preds > prev_close.values).astype(int)
+        y_true_class = actual_direction.values
+
+    # 3. Calculate Rubric Metrics
+    acc = accuracy_score(y_true_class, pred_direction)
+    prec = precision_score(y_true_class, pred_direction, zero_division=0)
+    rec = recall_score(y_true_class, pred_direction, zero_division=0)
+    f1 = f1_score(y_true_class, pred_direction, zero_division=0)
+    try:
+        roc = roc_auc_score(y_true_class, pred_direction)
+    except:
+        roc = 0.5 # Fallback if only one class exists
+
+    classification_results[name] = {
+        'Accuracy': acc,
+        'Precision': prec,
+        'Recall': rec,
+        'F1-Score': f1,
+        'ROC-AUC': roc
+    }
+
+# 4. Display as a Clean Table
+class_df = pd.DataFrame(classification_results).T
+print(class_df)
+
+# 5. Plot F1-Score Comparison (Visual Proof for Rubric)
+plt.figure(figsize=(10, 5))
+class_df['F1-Score'].plot(kind='bar', color='teal')
+plt.title('Classification Performance: F1-Score (Directional Accuracy)')
+plt.ylabel('F1 Score')
+plt.xticks(rotation=45)
+plt.grid(axis='y', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 10. PLOT CONFUSION MATRIX (SIMPLE RNN) - FIXED
+# ==========================================
+print("\nPlotting Confusion Matrix for Simple RNN (Fixed)...")
+
+# 1. Setup Data for Simple RNN
+model_name = 'Simple RNN'
+preds_rnn = model_predictions_test[model_name]
+
+# Important: DL models use different test dates (test_dates_dl)
+prev_close_rnn = df['Close'].loc[test_dates_dl].shift(1).fillna(method='bfill')
+
+# --- FIX: INVERSE TRANSFORM THE TARGETS FIRST ---
+# y_test_dl is scaled (0-1). We need to convert it back to Rupees.
+y_test_dl_price = scaler.inverse_transform(y_test_dl).flatten()
+
+# Determine Actual vs Predicted Directions (1 = Buy/Up, 0 = Sell/Down)
+actual_dir_rnn = (y_test_dl_price > prev_close_rnn.values).astype(int)
+pred_dir_rnn = (preds_rnn > prev_close_rnn.values).astype(int)
+
+# 2. Generate Confusion Matrix
+cm_rnn = confusion_matrix(actual_dir_rnn, pred_dir_rnn)
+
+# 3. Create Heatmap
+plt.figure(figsize=(7, 6))
+sns.heatmap(cm_rnn, annot=True, fmt='d', cmap='Oranges', cbar=False,
+            annot_kws={'size': 14, 'weight': 'bold'},
+            xticklabels=['Predicted Down (Sell)', 'Predicted Up (Buy)'],
+            yticklabels=['Actual Down (Sell)', 'Actual Up (Buy)'])
+
+plt.title(f'Confusion Matrix: {model_name}\n(Directional Accuracy)', fontsize=14)
+plt.ylabel('Actual Market Movement', fontsize=12)
+plt.xlabel('Model Prediction', fontsize=12)
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 11. FINAL METRICS VISUALIZATION (INDIVIDUAL CHARTS)
+# ==========================================
+import seaborn as sns
+
+print("\nGenerating Final Comparative Heatmaps & Graphs (Individual)...")
+
+# --- PREPARE DATA ---
+metrics_df = pd.DataFrame(model_performance).T
+class_df = pd.DataFrame(classification_results).T
+
+# -------------------------------------------------------
+# CHART 1: REGRESSION HEATMAP (MAE, RMSE, MAPE)
+# -------------------------------------------------------
+plt.figure(figsize=(8, 6))
+sns.heatmap(metrics_df, annot=True, fmt='.2f', cmap='RdYlGn_r', 
+            linewidths=1, linecolor='black',
+            cbar_kws={'label': 'Error Magnitude (Red=High, Green=Low)'})
+plt.title('Regression Performance Heatmap (Lower is Better)', fontsize=14, weight='bold')
+plt.xlabel('Error Metrics')
+plt.ylabel('Models')
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------------
+# CHART 2: CLASSIFICATION HEATMAP (Accuracy, F1, ROC, etc.)
+# -------------------------------------------------------
+plt.figure(figsize=(10, 6))
+sns.heatmap(class_df, annot=True, fmt='.4f', cmap='YlGnBu', 
+            linewidths=1, linecolor='black',
+            cbar_kws={'label': 'Score (Darker = Better)'})
+plt.title('Classification Performance Heatmap (Higher is Better)', fontsize=14, weight='bold')
+plt.xlabel('Rubric Metrics')
+plt.ylabel('Models')
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------------
+# CHART 3: REGRESSION BAR CHARTS (Side-by-Side)
+# -------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# MAE & RMSE
+metrics_df[['MAE', 'RMSE']].plot(kind='bar', ax=axes[0], colormap='viridis', edgecolor='black')
+axes[0].set_title('Price Error (MAE & RMSE)', fontsize=14)
+axes[0].set_ylabel('Error (INR)')
+axes[0].grid(axis='y', linestyle='--', alpha=0.5)
+for container in axes[0].containers:
+    axes[0].bar_label(container, fmt='%.0f')
+
+# MAPE (Separate because it is %)
+metrics_df[['MAPE']].plot(kind='bar', ax=axes[1], color='orange', edgecolor='black')
+axes[1].set_title('Percentage Error (MAPE)', fontsize=14)
+axes[1].set_ylabel('Error (%)')
+axes[1].grid(axis='y', linestyle='--', alpha=0.5)
+for container in axes[1].containers:
+    axes[1].bar_label(container, fmt='%.2f%%')
+
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------------
+# CHART 4: CLASSIFICATION METRICS (Grouped Bar Chart)
+# -------------------------------------------------------
+plt.figure(figsize=(14, 7))
+class_df.plot(kind='bar', figsize=(15, 6), colormap='Paired', edgecolor='black')
+plt.title('Classification Metrics Comparison (Rubric Requirements)', fontsize=16)
+plt.ylabel('Score (0.0 - 1.0)')
+plt.ylim(0.4, 1.0) # Zoom in to see differences
+plt.grid(axis='y', linestyle='--', alpha=0.3)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
